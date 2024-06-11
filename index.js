@@ -3,6 +3,15 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const stripe = require('stripe')('sk_test_51IgZ1HAy6mgpkkqAlsASKtiU0l36fMJsDktMByiuJg6DYzo9GNHi9ArHeZkcAr9v11rSH3d6T1tqpDGWk3DeKalz00Xtd7jXBM');
 const WebSocket = require('ws');
+const Pusher = require("pusher");
+
+const pusher = new Pusher({
+    appId: "1817619",
+    key: "f970d7239aada8585e32",
+    secret: "0e20af4e049543b1356c",
+    cluster: "ap2",
+    useTLS: true
+});
 
 const app = express();
 const port = 4000;
@@ -37,15 +46,9 @@ app.post('/webhook', async (req, res) => {
         case 'identity.verification_session.verified':
             const session = event.data.object;
 
-            // Notify all connected clients
-            for (const client of clients) {
-                if (client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify({
-                        type: 'verification_completed',
-                        data: session,
-                    }));
-                }
-            }
+            pusher.trigger("my-channel", "my-event", {
+                message: JSON.stringify(session)
+            });
             break;
         // ... handle other event types
         default:
