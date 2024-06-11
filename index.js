@@ -63,6 +63,9 @@ app.post('/create-verification-session', async (req, res) => {
         });
 
         const url = verificationSession.client_secret;
+        pusher.trigger("my-channel", "my-event", {
+            message: JSON.stringify(url)
+        });
         res.json({ url });
     } catch (error) {
         console.error('Error creating verification session:', error);
