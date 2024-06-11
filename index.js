@@ -40,20 +40,11 @@ wss.on('connection', (ws) => {
 // Handle Stripe webhooks
 app.post('/webhook', async (req, res) => {
     const event = req.body;
+    const session = event.data.object;
 
-    // Handle the event
-    switch (event.type) {
-        case 'identity.verification_session.verified':
-            const session = event.data.object;
-
-            pusher.trigger("my-channel", "my-event", {
-                message: JSON.stringify(session)
-            });
-            break;
-        // ... handle other event types
-        default:
-            console.log(`Unhandled event type ${event.type}`);
-    }
+    pusher.trigger("my-channel", "my-event", {
+        message: JSON.stringify(session)
+    });
 
     // Return a response to acknowledge receipt of the event
     res.json({ received: true });
