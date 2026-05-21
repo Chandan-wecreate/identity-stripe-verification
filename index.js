@@ -62,8 +62,8 @@ app.post('/create-verification-session', async (req, res) => {
             }
         });
 
-        const url = verificationSession.client_secret;
-        res.json({ url });
+        const client_secret = verificationSession.client_secret;
+        res.json({ client_secret });
     } catch (error) {
         console.error('Error creating verification session:', error);
         res.status(500).send('Internal Server Error');
