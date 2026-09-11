@@ -1,8 +1,12 @@
+if (process.env.NODE_ENV !== 'production') {
+    require('dotenv').config({ path: '.env.local' });
+}
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const stripe = require('stripe')('sk_test_51IgZ1HAy6mgpkkqAlsASKtiU0l36fMJsDktMByiuJg6DYzo9GNHi9ArHeZkcAr9v11rSH3d6T1tqpDGWk3DeKalz00Xtd7jXBM');
-const WebSocket = require('ws');
+const stripe = require('stripe')(process.env.STRIPE_SECRET);
+const stripeRestricted = require('stripe')(process.env.STRIPE_RESTRICTED);
 const Pusher = require("pusher");
 
 const pusher = new Pusher({
@@ -15,46 +19,457 @@ const pusher = new Pusher({
 
 const app = express();
 const port = 4000;
+const reportChannel = 'my-channel';
+const onboardingApiBaseUrl = 'https://onboarding-backend-orcin.vercel.app/api/onboarding';
+
+
+async function downloadStripeIdentityFile(fileId) {
+    if (!fileId) return null;
+
+    // Create a temporary FileLink using the restricted key
+    const fileLink = await stripeRestricted.fileLinks.create({
+        file: fileId,
+        expires_at: Math.floor(Date.now() / 1000) + 30
+    });
+
+    // Download the actual image bytes immediately
+    const response = await fetch(fileLink.url);
+
+    if (!response.ok) {
+        throw new Error(
+            `Failed to download Stripe Identity file ${fileId}: ${response.status}`
+        );
+    }
+
+    const contentType =
+        response.headers.get('content-type') || 'application/octet-stream';
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    return {
+        fileId,
+        contentType,
+        base64: buffer.toString('base64')
+    };
+}
+
+async function handleVerifiedSession(event) {
+    const session = event.data.object;
+    const ownerSub = session.metadata?.ownerSub;
+
+    if (!ownerSub) {
+        throw new Error(
+            `Verification session ${session.id} has no ownerSub metadata`
+        );
+    }
+
+    if (!session.last_verification_report) {
+        throw new Error(
+            `Verification session ${session.id} has no verification report`
+        );
+    }
+
+    // 1. Get report from Stripe
+    const report =
+        await stripe.identity.verificationReports.retrieve(
+            session.last_verification_report
+        );
+
+    const sensitiveSession =
+        await stripeRestricted.identity.verificationSessions.retrieve(
+            session.id,
+            {
+                expand: [
+                    'last_verification_report.document.expiration_date',
+                    'last_verification_report.document.number',
+                    'verified_outputs.dob',
+                    'verified_outputs.id_number'
+                ]
+            }
+        );
+
+    const sensitiveReport = sensitiveSession.last_verification_report;
+
+    if (sensitiveReport && typeof sensitiveReport !== 'string') {
+        report.document = {
+            ...report.document,
+            expiration_date:
+                sensitiveReport.document?.expiration_date,
+            number:
+                sensitiveReport.document?.number
+        };
+
+        report.verified_outputs = {
+            ...report.verified_outputs,
+            dob:
+                sensitiveSession.verified_outputs?.dob,
+            id_number:
+                sensitiveSession.verified_outputs?.id_number
+        };
+    }
+
+    const documentFileId =
+        report.document?.files?.[0];
+
+    const selfieFileId =
+        report.selfie?.selfie;
+
+    const documentFile =
+        await downloadStripeIdentityFile(documentFileId);
+
+    const selfieFile =
+        await downloadStripeIdentityFile(selfieFileId);
+
+    report.identityFiles = {
+        document: documentFile,
+        selfie: selfieFile
+    };
+
+    if (process.env.NODE_ENV !== 'production') {
+        console.dir(report, { depth: null, colors: true });
+    }
+
+    // 2. Save report/update onboarding FIRST
+    await saveVerificationReport(
+        ownerSub,
+        session,
+        report
+    );
+
+    // 3. Only tell frontend AFTER save succeeded
+    await pusher.trigger(
+        reportChannel,
+        'verification-report',
+        {
+            ownerSub,
+            sessionId: session.id,
+            reportId: report.id,
+            status: session.status
+        }
+    );
+}
+
+async function handleFailedVerification(event) {
+    const session = event.data.object;
+    const ownerSub = session.metadata?.ownerSub;
+
+    console.log(
+        'Verification requires input:',
+        session.id,
+        ownerSub
+    );
+}
+
+app.post(
+    '/webhook',
+    express.raw({ type: 'application/json' }),
+    async (req, res) => {
+        let event;
+        console.log("WEBHOOK TRIGGERED");
+
+        try {
+            const signature = req.headers['stripe-signature'];
+
+            event = stripe.webhooks.constructEvent(
+                req.body,
+                signature,
+                process.env.STRIPE_WEBHOOK_SECRET
+            );
+        } catch (err) {
+            console.error(
+                'Invalid Stripe webhook signature:',
+                err.message
+            );
+
+            return res.status(400).send('Invalid signature');
+        }
+
+        try {
+            switch (event.type) {
+                case 'identity.verification_session.verified':
+                    await handleVerifiedSession(event);
+                    break;
+
+                case 'identity.verification_session.requires_input':
+                    await handleFailedVerification(event);
+                    break;
+
+                default:
+                    break;
+            }
+
+            return res.sendStatus(200);
+        } catch (err) {
+            console.error('Stripe webhook processing failed:', err);
+            return res.sendStatus(500);
+        }
+    }
+);
+
 
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
 
-// Create the HTTP server and WebSocket server
-const server = require('http').createServer(app);
-const wss = new WebSocket.Server({ server });
+function normalizeName(str) {
+    if (typeof str !== 'string') return '';
+    return str.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
 
-// Store connected clients
-const clients = new Set();
+function extractFieldValue(field) {
+    if (!field) return '';
+    if (typeof field === 'object' && field.value !== undefined) return field.value;
+    if (typeof field === 'string') return field;
+    return '';
+}
 
-wss.on('connection', (ws) => {
-    console.log('Client connected');
-    clients.add(ws);
+function getOnboardingData(onboardingRecord) {
+    return onboardingRecord.data || onboardingRecord;
+}
 
-    ws.on('close', () => {
-        console.log('Client disconnected');
-        clients.delete(ws);
+function normalizeEmail(email) {
+    return typeof email === 'string' ? email.trim().toLowerCase() : '';
+}
+
+function canEvaluateApproval(target) {
+    return target === 'primary';
+}
+
+function getCoApplicants(onboardingRecord) {
+    const data = getOnboardingData(onboardingRecord);
+    if (Array.isArray(data.coApplicants)) return data.coApplicants;
+    return data.coApplicant ? [data.coApplicant] : [];
+}
+
+function findCoApplicant(onboardingRecord, email) {
+    const normalizedEmail = normalizeEmail(email);
+    return getCoApplicants(onboardingRecord).find(
+        (coApplicant) => normalizeEmail(coApplicant.email) === normalizedEmail
+    );
+}
+
+function checkApplicantNameMatch(applicant, stripeReport) {
+    if (!stripeReport || !stripeReport.document) return false;
+
+    const details = applicant?.details || applicant || {};
+    const submittedFirstName = extractFieldValue(details.firstName);
+    const submittedLastName = extractFieldValue(details.lastName);
+
+    const stripeFirstName = stripeReport.document?.first_name || '';
+    const stripeLastName = stripeReport.document?.last_name || '';
+
+    const normStripeFirst = normalizeName(stripeFirstName);
+    const normStripeLast = normalizeName(stripeLastName);
+    const normSubFirst = normalizeName(submittedFirstName);
+    const normSubLast = normalizeName(submittedLastName);
+
+    return !!(normStripeFirst && normStripeLast && normStripeFirst === normSubFirst && normStripeLast === normSubLast);
+}
+
+function checkNameMatch(onboardingRecord, stripeReport, target = 'primary') {
+    if (target === 'coApplicant') {
+        return getCoApplicants(onboardingRecord).some((coApplicant) =>
+            checkApplicantNameMatch(coApplicant, stripeReport)
+        );
+    }
+
+    const data = getOnboardingData(onboardingRecord);
+    return checkApplicantNameMatch(data.details, stripeReport);
+}
+
+function isVerifiedAndMatched(onboardingRecord, applicant, target) {
+    const verification = applicant?.stripeVerification;
+    return applicant?.identityVerificationComplete === true &&
+        verification?.status === 'verified' &&
+        (target === 'coApplicant'
+            ? checkApplicantNameMatch(applicant, verification.report)
+            : checkNameMatch(onboardingRecord, verification.report, target));
+}
+
+function isReadyForApproval(onboardingRecord) {
+    const data = getOnboardingData(onboardingRecord);
+    const primary = data.wizard;
+
+    if (!isVerifiedAndMatched(onboardingRecord, primary, 'primary')) {
+        return false;
+    }
+
+    const selection = primary?.personalAccountSelection;
+    if (!selection?.jointAccount) return true;
+
+    const expectedCoApplicants = selection.coApplicants || [];
+    return expectedCoApplicants.length > 0 && expectedCoApplicants.length <= 2 &&
+        expectedCoApplicants.every((coApplicant) => {
+        const email = normalizeEmail(coApplicant.email);
+        const completedCoApplicant = coApplicant.identityVerificationComplete === true
+            ? coApplicant
+            : findCoApplicant(onboardingRecord, email);
+        return !!email && isVerifiedAndMatched(
+            onboardingRecord,
+            completedCoApplicant,
+            'coApplicant'
+        );
     });
-});
+}
 
-// Handle Stripe webhooks
-app.post('/webhook', async (req, res) => {
-    const event = req.body;
-    const session = event.data.object;
+function buildCoApplicantPatch(onboardingRecord, email, stripeVerification) {
+    const data = getOnboardingData(onboardingRecord);
+    const selection = data.wizard?.personalAccountSelection;
+    const selectedCoApplicant = selection?.coApplicants?.find(
+        (applicant) => normalizeEmail(applicant.email) === normalizeEmail(email)
+    );
+    const coApplicant = selectedCoApplicant || findCoApplicant(onboardingRecord, email);
 
-    pusher.trigger("my-channel", "my-event", {
-        message: JSON.stringify(session)
+    if (!coApplicant) {
+        throw new Error(`No co-applicant found for ${email}`);
+    }
+
+    const updatedCoApplicant = {
+        ...coApplicant,
+        identityVerificationComplete: true,
+        stripeVerification
+    };
+
+    if (selectedCoApplicant) {
+        return {
+            wizard: {
+                personalAccountSelection: {
+                    ...selection,
+                    coApplicants: selection.coApplicants.map((applicant) =>
+                        normalizeEmail(applicant.email) === normalizeEmail(email)
+                            ? updatedCoApplicant
+                            : applicant
+                    )
+                }
+            }
+        };
+    }
+
+    return {
+        coApplicant: updatedCoApplicant,
+        coApplicants: Array.isArray(data.coApplicants)
+            ? data.coApplicants.map((applicant) =>
+                normalizeEmail(applicant.email) === normalizeEmail(email)
+                    ? updatedCoApplicant
+                    : applicant
+            )
+            : undefined
+    };
+}
+
+async function fetchOnboardingRecord(ownerSub) {
+    const response = await fetch(`${onboardingApiBaseUrl}/${encodeURIComponent(ownerSub)}`);
+    if (!response.ok) {
+        throw new Error(`Onboarding API returned ${response.status}: ${await response.text()}`);
+    }
+    return response.json();
+}
+
+async function patchOnboardingRecord(ownerSub, patchPayload) {
+    const response = await fetch(`${onboardingApiBaseUrl}/${encodeURIComponent(ownerSub)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerSub, ...patchPayload })
     });
 
-    // Return a response to acknowledge receipt of the event
-    res.json({ received: true });
+    if (!response.ok) {
+        throw new Error(`Onboarding API returned ${response.status}: ${await response.text()}`);
+    }
+}
+
+async function saveVerificationReport(ownerSub, session, report) {
+    const target = session.metadata?.target || 'primary';
+    const entityId = session.metadata?.entityId;
+    let patchPayload;
+
+    if (target === 'coApplicant') {
+        if (!normalizeEmail(entityId)) {
+            throw new Error(`Co-applicant verification session ${session.id} has no entityId`);
+        }
+
+        const onboardingRecord = await fetchOnboardingRecord(ownerSub);
+        patchPayload = buildCoApplicantPatch(onboardingRecord, entityId, {
+            sessionId: session.id,
+            reportId: report.id,
+            status: session.status,
+            report
+        });
+    } else {
+        patchPayload = {
+            wizard: {
+                identityVerificationComplete: true,
+                stripeVerification: {
+                    sessionId: session.id,
+                    reportId: report.id,
+                    status: session.status,
+                    report
+                }
+            }
+        };
+    }
+
+    await patchOnboardingRecord(ownerSub, patchPayload);
+
+    // Re-evaluate after every applicant update so the final verification can
+    // approve the application, regardless of which applicant finishes last.
+    const updatedRecord = await fetchOnboardingRecord(ownerSub);
+    if (isReadyForApproval(updatedRecord)) {
+        await patchOnboardingRecord(ownerSub, { reviewDecision: 'Accepted' });
+    }
+}
+
+// Endpoint to re-evaluate name match and auto-approve (e.g. from frontend review summary)
+app.post('/evaluate-approval', async (req, res) => {
+    const { ownerSub, target } = req.body || {};
+
+    if (typeof ownerSub !== 'string' || !ownerSub.trim()) {
+        return res.status(400).json({ error: 'ownerSub is required' });
+    }
+
+    if (!canEvaluateApproval(target)) {
+        return res.json({
+            autoApproved: false,
+            reason: 'Only the primary applicant can evaluate approval'
+        });
+    }
+
+    try {
+        const onboardingRecord = await fetchOnboardingRecord(ownerSub);
+        if (isReadyForApproval(onboardingRecord)) {
+            await patchOnboardingRecord(ownerSub, { reviewDecision: 'Accepted' });
+            return res.json({ autoApproved: true, reviewDecision: 'Accepted' });
+        }
+
+        return res.json({ autoApproved: false, reason: 'Not every required applicant is verified and name-matched' });
+    } catch (error) {
+        console.error('Error evaluating approval:', error);
+        res.status(500).send('Internal Server Error');
+    }
 });
 
 // Endpoint to create a verification session
 app.post('/create-verification-session', async (req, res) => {
+    const { ownerSub, target = 'primary', entityId, entityKind } = req.body || {};
+
+    console.log("VERIFICATION SESSION TRIGGERED", req.body)
+
+    if (typeof ownerSub !== 'string' || !ownerSub.trim()) {
+        return res.status(400).json({ error: 'ownerSub is required' });
+    }
+
+    if (target === 'coApplicant' && !normalizeEmail(entityId)) {
+        return res.status(400).json({ error: 'entityId (the co-applicant email) is required' });
+    }
+
     try {
+        const metadata = { ownerSub, target };
+        if (entityId) metadata.entityId = entityId;
+        if (entityKind) metadata.entityKind = entityKind;
+
         const verificationSession = await stripe.identity.verificationSessions.create({
             type: 'document',
+            metadata,
             options: {
                 document: {
                     require_matching_selfie: true
@@ -62,16 +477,21 @@ app.post('/create-verification-session', async (req, res) => {
             }
         });
 
-        const client_secret = verificationSession.client_secret;
-        res.json({ client_secret });
+        res.json({
+            client_secret: verificationSession.client_secret,
+            verification_session_id: verificationSession.id
+        });
     } catch (error) {
         console.error('Error creating verification session:', error);
         res.status(500).send('Internal Server Error');
     }
 });
 
-server.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-});
+if (require.main === module) {
+    app.listen(port, () => {
+        console.log(`Server running at http://localhost:${port}`);
+    });
+}
 
 module.exports = app;
+module.exports._test = { buildCoApplicantPatch, canEvaluateApproval, isReadyForApproval };
