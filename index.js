@@ -57,12 +57,20 @@ async function downloadStripeIdentityFile(fileId) {
 async function handleVerifiedSession(event) {
     const session = event.data.object;
     const ownerSub = session.metadata?.ownerSub;
+    const onboardingId = parseOnboardingId(session.metadata?.onboardingId);
 
     if (!ownerSub) {
         throw new Error(
             `Verification session ${session.id} has no ownerSub metadata`
         );
     }
+
+    if (!onboardingId) {
+        throw new Error(`Verification session ${session.id} has an invalid onboardingId`);
+    }
+
+    const onboardingRecord = await fetchOnboardingRecord(onboardingId);
+    assertRecordOwner(onboardingRecord, ownerSub);
 
     if (!session.last_verification_report) {
         throw new Error(
@@ -126,16 +134,8 @@ async function handleVerifiedSession(event) {
         selfie: selfieFile
     };
 
-    if (process.env.NODE_ENV !== 'production') {
-        console.dir(report, { depth: null, colors: true });
-    }
-
     // 2. Save report/update onboarding FIRST
-    await saveVerificationReport(
-        ownerSub,
-        session,
-        report
-    );
+    await saveVerificationReport(onboardingRecord, session, report);
 
     // 3. Only tell frontend AFTER save succeeded
     await pusher.trigger(
@@ -143,6 +143,7 @@ async function handleVerifiedSession(event) {
         'verification-report',
         {
             ownerSub,
+            onboardingId,
             sessionId: session.id,
             reportId: report.id,
             status: session.status
@@ -152,13 +153,7 @@ async function handleVerifiedSession(event) {
 
 async function handleFailedVerification(event) {
     const session = event.data.object;
-    const ownerSub = session.metadata?.ownerSub;
-
-    console.log(
-        'Verification requires input:',
-        session.id,
-        ownerSub
-    );
+    console.log('Verification requires input:', session.id, session.metadata?.onboardingId);
 }
 
 app.post(
@@ -236,6 +231,53 @@ function canEvaluateApproval(target) {
     return target === 'primary';
 }
 
+function parseOnboardingId(value) {
+    const id = typeof value === 'number' ? value : Number(value);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function getRecordOwner(record) {
+    return record?.owner_sub;
+}
+
+function getOnboardingType(record) {
+    return record?.data?.wizard?.selectedAccountType || '';
+}
+
+function validateOnboardingType(record, requestedType) {
+    const type = getOnboardingType(record);
+    if (!['personal', 'business'].includes(type)) {
+        const error = new Error('Selected onboarding has an invalid onboarding type');
+        error.status = 422;
+        throw error;
+    }
+    if (requestedType && requestedType !== type) {
+        const error = new Error('Onboarding type does not match the selected onboarding');
+        error.status = 422;
+        throw error;
+    }
+    return type;
+}
+
+function assertRecordOwner(record, ownerSub) {
+    if (!record || getRecordOwner(record) !== ownerSub) {
+        const error = new Error('Onboarding record not found');
+        error.status = 404;
+        throw error;
+    }
+}
+
+function buildVerificationMetadata(onboardingRecord, target, entityId, entityKind) {
+    return {
+        ownerSub: getRecordOwner(onboardingRecord),
+        onboardingId: String(onboardingRecord.id),
+        onboardingType: String(getOnboardingType(onboardingRecord)),
+        target,
+        ...(entityId ? { entityId: String(entityId) } : {}),
+        ...(entityKind ? { entityKind } : {})
+    };
+}
+
 function getCoApplicants(onboardingRecord) {
     const data = getOnboardingData(onboardingRecord);
     if (Array.isArray(data.coApplicants)) return data.coApplicants;
@@ -293,6 +335,16 @@ function isReadyForApproval(onboardingRecord) {
 
     if (!isVerifiedAndMatched(onboardingRecord, primary, 'primary')) {
         return false;
+    }
+
+    const businessParticipants = [
+        ...(Array.isArray(data.representatives) ? data.representatives : []),
+        ...(Array.isArray(data.directors) ? data.directors : [])
+    ];
+    if (businessParticipants.length > 0) {
+        return businessParticipants.every((participant) =>
+            isVerifiedAndMatched(onboardingRecord, participant, 'coApplicant')
+        );
     }
 
     const selection = primary?.personalAccountSelection;
@@ -358,19 +410,63 @@ function buildCoApplicantPatch(onboardingRecord, email, stripeVerification) {
     };
 }
 
-async function fetchOnboardingRecord(ownerSub) {
-    const response = await fetch(`${onboardingApiBaseUrl}/${encodeURIComponent(ownerSub)}`);
+function getEntityCollection(data, entityKind) {
+    if (entityKind === 'representative') return data.representatives;
+    if (entityKind === 'director') return data.directors;
+    return null;
+}
+
+function getEntityId(entity) {
+    return String(entity?.id ?? entity?.entityId ?? '');
+}
+
+function buildEntityPatch(onboardingRecord, entityId, entityKind, stripeVerification) {
+    const data = getOnboardingData(onboardingRecord);
+    const entities = getEntityCollection(data, entityKind);
+    if (!Array.isArray(entities)) {
+        throw new Error(`Unsupported entityKind: ${entityKind}`);
+    }
+
+    const targetId = String(entityId);
+    if (!entities.some((entity) => getEntityId(entity) === targetId)) {
+        throw new Error(`No ${entityKind} found for ${entityId}`);
+    }
+
+    return {
+        [entityKind === 'representative' ? 'representatives' : 'directors']:
+            entities.map((entity) => getEntityId(entity) === targetId
+                ? { ...entity, identityVerificationComplete: true, stripeVerification }
+                : entity)
+    };
+}
+
+function assertVerificationTargetExists(onboardingRecord, target, entityId, entityKind) {
+    if (target === 'primary') return;
+    if (target === 'coApplicant') {
+        const data = getOnboardingData(onboardingRecord);
+        const selected = data.wizard?.personalAccountSelection?.coApplicants || [];
+        if (selected.some((applicant) => normalizeEmail(applicant.email) === normalizeEmail(entityId)) ||
+            findCoApplicant(onboardingRecord, entityId)) return;
+        throw new Error(`No co-applicant found for ${entityId}`);
+    }
+    buildEntityPatch(onboardingRecord, entityId, entityKind, {});
+}
+
+async function fetchOnboardingRecord(onboardingId) {
+    const response = await fetch(`${onboardingApiBaseUrl}/${onboardingId}`);
     if (!response.ok) {
-        throw new Error(`Onboarding API returned ${response.status}: ${await response.text()}`);
+        const error = new Error(`Onboarding API returned ${response.status}`);
+        error.status = response.status === 404 ? 404 : 502;
+        throw error;
     }
     return response.json();
 }
 
-async function patchOnboardingRecord(ownerSub, patchPayload) {
-    const response = await fetch(`${onboardingApiBaseUrl}/${encodeURIComponent(ownerSub)}`, {
+async function patchOnboardingRecord(onboardingId, ownerSub, patchPayload) {
+    const response = await fetch(`${onboardingApiBaseUrl}/${onboardingId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ownerSub, ...patchPayload })
+        body: JSON.stringify({ ownerSub, onboardingId, ...patchPayload })
     });
 
     if (!response.ok) {
@@ -378,7 +474,9 @@ async function patchOnboardingRecord(ownerSub, patchPayload) {
     }
 }
 
-async function saveVerificationReport(ownerSub, session, report) {
+async function saveVerificationReport(onboardingRecord, session, report) {
+    const ownerSub = session.metadata?.ownerSub;
+    const onboardingId = parseOnboardingId(session.metadata?.onboardingId);
     const target = session.metadata?.target || 'primary';
     const entityId = session.metadata?.entityId;
     let patchPayload;
@@ -388,43 +486,60 @@ async function saveVerificationReport(ownerSub, session, report) {
             throw new Error(`Co-applicant verification session ${session.id} has no entityId`);
         }
 
-        const onboardingRecord = await fetchOnboardingRecord(ownerSub);
         patchPayload = buildCoApplicantPatch(onboardingRecord, entityId, {
-            sessionId: session.id,
+            verificationSessionId: session.id,
             reportId: report.id,
             status: session.status,
             report
         });
-    } else {
+    } else if (target === 'entity') {
+        if (!entityId || !session.metadata?.entityKind) {
+            throw new Error(`Entity verification session ${session.id} is missing entity metadata`);
+        }
+        patchPayload = buildEntityPatch(onboardingRecord, entityId, session.metadata.entityKind, {
+            verificationSessionId: session.id,
+            reportId: report.id,
+            status: session.status,
+            report
+        });
+    } else if (target === 'primary') {
         patchPayload = {
             wizard: {
                 identityVerificationComplete: true,
                 stripeVerification: {
-                    sessionId: session.id,
+                    verificationSessionId: session.id,
                     reportId: report.id,
                     status: session.status,
                     report
                 }
             }
         };
+    } else {
+        throw new Error(`Unsupported verification target: ${target}`);
     }
 
-    await patchOnboardingRecord(ownerSub, patchPayload);
+    await patchOnboardingRecord(onboardingId, ownerSub, patchPayload);
 
     // Re-evaluate after every applicant update so the final verification can
     // approve the application, regardless of which applicant finishes last.
-    const updatedRecord = await fetchOnboardingRecord(ownerSub);
+    const updatedRecord = await fetchOnboardingRecord(onboardingId);
+    assertRecordOwner(updatedRecord, ownerSub);
     if (isReadyForApproval(updatedRecord)) {
-        await patchOnboardingRecord(ownerSub, { reviewDecision: 'Accepted' });
+        await patchOnboardingRecord(onboardingId, ownerSub, { reviewDecision: 'Accepted' });
     }
 }
 
 // Endpoint to re-evaluate name match and auto-approve (e.g. from frontend review summary)
 app.post('/evaluate-approval', async (req, res) => {
-    const { ownerSub, target } = req.body || {};
+    const { ownerSub, onboardingId, target } = req.body || {};
 
     if (typeof ownerSub !== 'string' || !ownerSub.trim()) {
         return res.status(400).json({ error: 'ownerSub is required' });
+    }
+
+    const recordId = parseOnboardingId(onboardingId);
+    if (!recordId) {
+        return res.status(400).json({ error: 'A positive numeric onboardingId is required' });
     }
 
     if (!canEvaluateApproval(target)) {
@@ -435,37 +550,56 @@ app.post('/evaluate-approval', async (req, res) => {
     }
 
     try {
-        const onboardingRecord = await fetchOnboardingRecord(ownerSub);
+        const onboardingRecord = await fetchOnboardingRecord(recordId);
+        assertRecordOwner(onboardingRecord, ownerSub);
         if (isReadyForApproval(onboardingRecord)) {
-            await patchOnboardingRecord(ownerSub, { reviewDecision: 'Accepted' });
+            await patchOnboardingRecord(recordId, ownerSub, { reviewDecision: 'Accepted' });
             return res.json({ autoApproved: true, reviewDecision: 'Accepted' });
         }
 
         return res.json({ autoApproved: false, reason: 'Not every required applicant is verified and name-matched' });
     } catch (error) {
         console.error('Error evaluating approval:', error);
-        res.status(500).send('Internal Server Error');
+        res.status(error.status || 500).json({ error: error.message });
     }
 });
 
 // Endpoint to create a verification session
 app.post('/create-verification-session', async (req, res) => {
-    const { ownerSub, target = 'primary', entityId, entityKind } = req.body || {};
-
-    console.log("VERIFICATION SESSION TRIGGERED", req.body)
+    const { ownerSub, onboardingId, onboardingType, target = 'primary', entityId, entityKind } = req.body || {};
 
     if (typeof ownerSub !== 'string' || !ownerSub.trim()) {
         return res.status(400).json({ error: 'ownerSub is required' });
+    }
+
+    const recordId = parseOnboardingId(onboardingId);
+    if (!recordId) {
+        return res.status(400).json({ error: 'A positive numeric onboardingId is required' });
     }
 
     if (target === 'coApplicant' && !normalizeEmail(entityId)) {
         return res.status(400).json({ error: 'entityId (the co-applicant email) is required' });
     }
 
+    if (target === 'entity' && (!entityId || !['representative', 'director'].includes(entityKind))) {
+        return res.status(400).json({ error: 'entityId and a valid entityKind are required' });
+    }
+
+    if (!['primary', 'coApplicant', 'entity'].includes(target)) {
+        return res.status(400).json({ error: 'target must be primary, coApplicant, or entity' });
+    }
+
     try {
-        const metadata = { ownerSub, target };
-        if (entityId) metadata.entityId = entityId;
-        if (entityKind) metadata.entityKind = entityKind;
+        const onboardingRecord = await fetchOnboardingRecord(recordId);
+        assertRecordOwner(onboardingRecord, ownerSub);
+        validateOnboardingType(onboardingRecord, onboardingType);
+        try {
+            assertVerificationTargetExists(onboardingRecord, target, entityId, entityKind);
+        } catch (error) {
+            return res.status(404).json({ error: error.message });
+        }
+
+        const metadata = buildVerificationMetadata(onboardingRecord, target, entityId, entityKind);
 
         const verificationSession = await stripe.identity.verificationSessions.create({
             type: 'document',
@@ -483,7 +617,7 @@ app.post('/create-verification-session', async (req, res) => {
         });
     } catch (error) {
         console.error('Error creating verification session:', error);
-        res.status(500).send('Internal Server Error');
+        res.status(error.status || 500).json({ error: error.message });
     }
 });
 
@@ -494,4 +628,16 @@ if (require.main === module) {
 }
 
 module.exports = app;
-module.exports._test = { buildCoApplicantPatch, canEvaluateApproval, isReadyForApproval };
+module.exports._test = {
+    buildCoApplicantPatch,
+    buildEntityPatch,
+    buildVerificationMetadata,
+    canEvaluateApproval,
+    isReadyForApproval,
+    parseOnboardingId,
+    assertRecordOwner,
+    assertVerificationTargetExists,
+    validateOnboardingType,
+    fetchOnboardingRecord,
+    patchOnboardingRecord
+};
